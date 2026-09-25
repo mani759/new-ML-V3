@@ -18,7 +18,7 @@ from typing import List, Optional
 
 import joblib
 from fastapi import Depends, FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 import risk_engine as RE
 
@@ -42,12 +42,17 @@ class WorkIn(BaseModel):
     state: str
     ida: str                                # District Authority, exactly as in eSAKSHI
     mp_name: str
-    activity_type: str                      # one of the 115 eSAKSHI activity types
-    work_description: str
-    recommended_amount: float
+    # activity_type / work_description / recommended_amount may be null for real eSAKSHI works
+    # (pending works named 'NA-...', works with no description, works sanctioned without a
+    # recommended-list record). Nulls are scored exactly as the batch pipeline scores them.
+    activity_type: Optional[str] = None     # one of the 115 eSAKSHI activity types, or null if not recorded
+    work_description: Optional[str] = None
+    recommended_amount: Optional[float] = None  # at least one of recommended_amount / sanction_amount is required
     recommendation_date: str                # YYYY-MM-DD
     work_id: Optional[int] = None           # omit for a new work
     constituency: Optional[str] = None
+    # Omitted -> 'Normal/Others' (unchanged documented default for the live form).
+    # Explicit null -> kept null all the way to the engine (batch treats it as 'NA').
     work_category: Optional[str] = 'Normal/Others'
     sanction_date: Optional[str] = None
     sanction_amount: Optional[float] = None
@@ -62,6 +67,14 @@ class WorkIn(BaseModel):
     vendor_count: int = 0
     last_payment_date: Optional[str] = None
     as_of: Optional[str] = None             # scoring date; omit = today
+
+    @model_validator(mode='after')
+    def _need_an_amount(self):
+        # The engine scores amount = sanction_amount, else recommended_amount. With neither there is
+        # nothing real to score, and no amount is invented.
+        if self.recommended_amount is None and self.sanction_amount is None:
+            raise ValueError('recommended_amount or sanction_amount is required')
+        return self
 
 
 class BatchIn(BaseModel):
@@ -82,7 +95,9 @@ def version():
 
 def _one(w: WorkIn, as_of=None):
     d = w.model_dump()
-    if d.get('in_sanctioned_list') and not d.get('sanction_amount'):
+    # Only fall back to a REAL recommended amount; with recommended_amount=null the sanction amount stays as given
+    # (overwriting it with None made the scored amount NaN and the response un-serialisable).
+    if d.get('in_sanctioned_list') and not d.get('sanction_amount') and d.get('recommended_amount') is not None:
         d['sanction_amount'] = d['recommended_amount']
     return RE.score_one(d, BENCH, MODELS, as_of=as_of or d.pop('as_of', None))
 

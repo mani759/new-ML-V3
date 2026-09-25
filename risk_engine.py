@@ -55,6 +55,16 @@ def _rs(x) -> str:
     return f"Rs {x / 1e7:.2f} Cr" if abs(x) >= 1e7 else f"Rs {x / 1e5:.1f} L"
 
 
+def _missing(x) -> bool:
+    """True for None / NaN / blank text (how a missing eSAKSHI value arrives in batch or live)."""
+    return x is None or (isinstance(x, float) and np.isnan(x)) or str(x).strip() == ''
+
+
+def _act(x) -> str:
+    """Activity type for reason text; a missing value reads as such instead of 'nan'."""
+    return 'activity type not recorded' if _missing(x) else str(x)
+
+
 def prepare(works: pd.DataFrame) -> pd.DataFrame:
     """Parse dates, derive text/type columns. Safe to call on one row."""
     w = works.copy()
@@ -238,13 +248,14 @@ def apply_rules(f: pd.DataFrame, dup: pd.DataFrame) -> pd.Series:
     exp_ = live & (f['cost_ratio'] > 4) & (f['cost_z'] > 2) & ~f['is_bundled']
     add(exp_, 'unusually_expensive', 'medium', lambda r:
         f"{_rs(r.amount)} is {r.cost_ratio:.1f}x the median of similar works "
-        f"({r.activity_type}, {r.kind}; median {_rs(r.peer_median)}).")
+        f"({_act(r.activity_type)}, {r.kind}; median {_rs(r.peer_median)}).")
     add(live & f['is_bundled'] & (f['cost_ratio'] > 3), 'bundled_work', 'low', lambda r:
         f"One work covering many locations ({_rs(r.amount)}); cost per location cannot be verified "
         f"from the public record.")
     add(live & f['is_vague'] & (f['cost_ratio'] > 1) & ~f['is_bundled'], 'vague_description', 'low', lambda r:
-        f"Description is only '{str(r.work_description)[:60]}' for {_rs(r.amount)}; the public record does "
-        f"not say what is being built or bought.")
+        (f"No description is recorded for {_rs(r.amount)}; " if _missing(r.work_description) else
+         f"Description is only '{str(r.work_description)[:60]}' for {_rs(r.amount)}; ") +
+        "the public record does not say what is being built or bought.")
     add(f['is_completed'] & (f['actual_cost'] < 0.5 * f['amount']), 'completed_far_below_sanction', 'medium',
         lambda r: f"Completed for {_rs(r.actual_cost)}, under half of the sanctioned {_rs(r.amount)}.")
     # --- duplicates
@@ -266,9 +277,9 @@ def apply_rules(f: pd.DataFrame, dup: pd.DataFrame) -> pd.Series:
         f"been paid for {int(r.days_since_payment)} days.")
     fast = f['is_completed'] & f['kind'].eq('construction') & (f['completion_days'] >= 0)
     add(fast & (f['completion_days'] == 0), 'construction_same_day', 'high', lambda r:
-        f"Construction work ({r.activity_type}) marked completed on the same day it was sanctioned.")
+        f"Construction work ({_act(r.activity_type)}) marked completed on the same day it was sanctioned.")
     add(fast & f['completion_days'].between(1, 7), 'construction_within_7_days', 'medium', lambda r:
-        f"Construction work ({r.activity_type}) marked completed {int(r.completion_days)} day(s) after sanction.")
+        f"Construction work ({_act(r.activity_type)}) marked completed {int(r.completion_days)} day(s) after sanction.")
     add(f['in_sanctioned_list'] & ~f['in_recommended_list'], 'no_recommendation_record', 'medium', lambda r:
         "Sanctioned, but the work has no record in the MP-recommended list.")
     add(f['is_completed'] & (f['payment_count'] == 0), 'completed_without_payment', 'medium', lambda r:
@@ -358,12 +369,17 @@ def score_one(work: dict, bench: dict, models: dict, as_of=None) -> dict:
     as_of = as_of or pd.Timestamp.now().strftime('%Y-%m-%d')
     w = pd.DataFrame([work])
     for c in ('house', 'state', 'ida', 'mp_name', 'constituency', 'activity_type', 'work_description', 'stage',
-              'recommendation_date', 'sanction_date', 'completion_date', 'last_payment_date', 'actual_cost', 'work_id'):
+              'recommendation_date', 'sanction_date', 'completion_date', 'last_payment_date', 'actual_cost', 'work_id',
+              'work_category', 'recommended_amount', 'sanction_amount'):
         if c not in w:
             w[c] = None
     w['stage'] = w['stage'].fillna('Pending for Sanction')
-    if 'work_category' not in w or w['work_category'].isna().all():
-        w['work_category'] = 'Normal/Others'
+    # OLD: a null work_category was replaced with 'Normal/Others'; the batch pipeline keeps it null
+    # (delay model category 'NA'), so live scoring now does the same.
+    # if 'work_category' not in w or w['work_category'].isna().all():
+    #     w['work_category'] = 'Normal/Others'
+    for c in ('recommended_amount', 'sanction_amount', 'actual_cost'):
+        w[c] = pd.to_numeric(w[c], errors='coerce')   # None -> NaN, as in the batch CSV load
     f = features(w, None, bench, as_of)
     dup = duplicate_flags(f, bench)
     rules = apply_rules(f, dup)
