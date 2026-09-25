@@ -1,0 +1,9 @@
+# Pinned: artifacts/*.pkl must be loaded with the same scikit-learn version they were trained with.
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+pydantic==2.13.5
+pandas==3.0.2
+numpy==2.4.4
+scikit-learn==1.8.0
+joblib==1.5.3
+requests==2.33.1
